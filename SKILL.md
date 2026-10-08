@@ -50,6 +50,7 @@ For each collection, say concretely what happens at each count. Be specific to t
 - What does the query do in the database: is the filter column indexed, is it a full scan, does it join per row?
 - How often does it run? A poll every 5 seconds × open tabs × users. A cron that fans out one job per item.
 - What happens when one item is slow or failing: does it block the rest?
+- Does anything carry the collection in a size-limited place: ids in a URL or query string, a cookie, a header, a queue message, a single DB row or document, a log line? Those have hard limits that fail loudly or, worse, silently at a proxy.
 
 ## 4. Find where it breaks
 
@@ -68,6 +69,38 @@ For each collection, pick one:
 Don't over-engineer. Virtualising a list that will never pass 30 rows is cost with no benefit. Match the fix to the break point.
 
 Reuse what the codebase already has. Before recommending pagination, search for an existing paginated list, a shared table, a search-select or a batched query hook, and point to it.
+
+## Worked examples
+
+These show the depth expected. Do the arithmetic, name the limit, and size the fix to it.
+
+### Nested dropdowns: 30 parents × 20 children
+
+A sidebar has top-level buttons that each expand into sub-buttons. The demo has 3 parents with 4 children each and looks clean. A real org has 30 parents with 20 children each.
+
+- **Items:** 30 + (30 × 20) = **630** interactive items. If the children are always rendered and hidden with CSS, that's 630 buttons in the DOM on every page load, each with its own handlers, icons and tooltips.
+- **Height:** collapsed, 30 × 40px = 1,200px, already more than one laptop screen. Each open parent adds 20 × 36px = 720px. With "expand all", or with several left open, it's about **22,800px** of sidebar. The user loses their place, and the active item scrolls out of view.
+- **Keyboard and screen reader:** up to 630 tab stops with everything expanded. A screen reader announces "button, 1 of 20" with no sense of where it sits in the larger tree.
+- **Findability:** finding one child means guessing its parent, opening it, and scanning 20 items. Worst case, that's 30 guesses.
+- **Binding constraint:** humans can't scan it. Render cost comes second. Breaks at roughly 8–10 parents, or as soon as any parent has more than about 10 children.
+- **Fix, sized to the counts:**
+  - Expected count: single-open accordion (opening one closes the others), auto-expand and scroll to the active item, a search box that filters both levels and auto-expands matches, and render children only when their parent opens.
+  - Stretch count: switch to a master–detail layout (parents in a list, children in the main panel) or a command palette. Virtualise a flattened tree only if it must stay one list.
+
+### GET with URL params: selections that outgrow the URL
+
+A "bulk view" page puts the selected cron ids in the query string: `GET /crons/runs?ids=<uuid>,<uuid>,...`. It works for the 5 selected in the demo.
+
+- **Size per id:** a UUID is 36 characters, plus a comma (or `%2C` when encoded, 3 more). Call it about 37–39 bytes.
+- **At 200 selected:** about 7.6KB for the ids alone, before the path, other filters, and the `Host` and cookie headers.
+- **Limits along the path:** IIS's default query string limit is 2,048 bytes (about 50 ids). nginx's default `large_client_header_buffers` is 8k per request line (about 200 ids). Apache's `LimitRequestLine` is 8,190 bytes. CloudFront caps URLs at 8,192 bytes. Past these you get `414 URI Too Long` or `400`, often from a proxy rather than your app, so the app's logs show nothing.
+- **Response size too:** the same endpoint returns every run for every selected cron. At 200 crons × 500 runs × ~1KB, that's about 100MB. That's past a synchronous Lambda response limit of 6MB, past API Gateway's 10MB, and far past what a browser should parse in one go.
+- **Binding constraint:** request line length breaks first, at 50–200 ids depending on the hop. Response size breaks shortly after.
+- **Fix, sized to the counts:**
+  - Change the access pattern so the request carries intent, not enumeration. Send the filter that produced the selection (`?status=failed&project=x`) and let the server resolve it, or store the selection server-side and pass a short `selectionId`.
+  - If an explicit list is unavoidable, use `POST /crons/runs/search` with a JSON body. Document that it's a read, and note it gives up HTTP caching.
+  - Paginate the response with a cursor and a server-enforced maximum page size. Return summary fields, not full run objects.
+  - Add guardrails: cap the selection in the UI ("up to 100"), validate the cap on the server too, and return a clear `413` or `400` message rather than letting a proxy fail it silently.
 
 ## Output
 
